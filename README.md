@@ -260,6 +260,12 @@ curl -s -X POST http://localhost:8000/api/v1/audits/diff \
   `diff_position` 行是该字符所在 `+` 行在**整个 diff 文本中的行号**，列含前导 `+`
   的 1 列偏移。`result_index` 可直接索引到 `result.controls[]` / `result.errors[]` /
   `result.dangerous_spans[]` 的对应元素，`logical_index` 与其保持一致。
+- 新增行带 `\ No newline at end of file` 标记且后面仍有新增行时，重建文本把两行
+  **直接拼接**（不补 `\n`）；此时解析器报告的是拼接后重建文本的行号，不能用来定位
+  新增行。因此 controls、errors、dangerous_spans 一律按重建文本的**逻辑偏移**映射回
+  各自的新增行：落在无换行拼接点上的包含式位置（控制符、错误字符、区段起点）是
+  **后一条新增行的首字符**；半开区段终点（以及合成 `\n` 分隔符位置）则归属
+  **前一条新增行的行尾**（列 = 末字符列 +1）。
 - `result` 是对**重建后新增文本**（无新增行之间的空行拼接问题：按新文件顺序逐行
   连接，行末按 No-newline 标记决定是否补 `\n`）的原始解析结果，结构与
   `POST /api/v1/audits` 完全一致，因此该记录同样支持 `verify` 与 `sarif`；

@@ -166,6 +166,117 @@ def test_no_newline_mid_hunk_then_more_lines(client):
     assert item["result"]["controls"][0]["logical_index"] == 0
 
 
+def test_no_newline_join_maps_controls_to_their_own_added_line(client):
+    # The marker glues added line 2 onto rebuilt line 1, but its controls
+    # must map to added line 2 (diff line 6), not to the previous line.
+    diff = (
+        "--- a/f.c\n+++ b/f.c\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+a\n"
+        "\\ No newline at end of file\n"
+        f"+b{RLO}c{PDF}d\n"
+        "+tail\n"
+    )
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 201, resp.text
+    item = resp.json()["items"][0]
+    # the rebuild still concatenates the two lines without a separator
+    assert item["text_length"] == len(f"ab{RLO}c{PDF}d\ntail\n")
+    controls = item["locations"]["controls"]
+    assert [(c["position"]["line"], c["position"]["column"])
+            for c in controls] == [(2, 2), (2, 4)]
+    assert [(c["diff_position"]["line"], c["diff_position"]["column"])
+            for c in controls] == [(6, 3), (6, 5)]
+    # logical indices still match the untouched parse result
+    assert [c["logical_index"] for c in controls] == \
+        [c2["logical_index"] for c2 in item["result"]["controls"]]
+    span = item["locations"]["dangerous_spans"][0]
+    assert span["position"] == {
+        "start": {"line": 2, "column": 2}, "end": {"line": 2, "column": 4}
+    }
+    assert span["diff_position"] == {
+        "start": {"line": 6, "column": 3}, "end": {"line": 6, "column": 5}
+    }
+    # the persisted record carries the same locations and still verifies
+    detail = client.get(f"/api/v1/audits/{item['id']}").json()
+    assert detail["raw_text"] == f"ab{RLO}c{PDF}d\ntail\n"
+    assert detail["meta"]["source"] == "unified_diff"
+    assert detail["meta"]["locations"]["controls"][0]["position"] == \
+        {"line": 2, "column": 2}
+    verify = client.get(f"/api/v1/audits/{item['id']}/verify").json()
+    assert verify["consistent"] is True
+
+
+def test_no_newline_join_point_is_the_following_lines_first_char(client):
+    # The opener is the first character of the glued-on line: the span
+    # start sits exactly on the join point and belongs to that line.
+    diff = (
+        "--- a/f.c\n+++ b/f.c\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+ab\n"
+        "\\ No newline at end of file\n"
+        f"+{RLO}x{PDF}\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    item = body["items"][0]
+    controls = item["locations"]["controls"]
+    assert [(c["position"]["line"], c["position"]["column"])
+            for c in controls] == [(2, 1), (2, 3)]
+    assert [(c["diff_position"]["line"], c["diff_position"]["column"])
+            for c in controls] == [(6, 2), (6, 4)]
+    span = item["locations"]["dangerous_spans"][0]
+    assert span["position"]["start"] == {"line": 2, "column": 1}
+    assert span["diff_position"]["start"] == {"line": 6, "column": 2}
+    assert span["position"]["end"] == {"line": 2, "column": 3}
+    assert span["diff_position"]["end"] == {"line": 6, "column": 4}
+
+
+def test_no_newline_join_half_open_end_stays_on_the_preceding_line(client):
+    # The span's exclusive end lands exactly on the join point: the last
+    # covered character is the preceding line's last character, so the
+    # end position closes that line (column one past its last character).
+    diff = (
+        "--- a/f.c\n+++ b/f.c\n"
+        "@@ -0,0 +1,2 @@\n"
+        f"+a{RLO}\n"
+        "\\ No newline at end of file\n"
+        f"+{PDF}x\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    item = body["items"][0]
+    span = item["locations"]["dangerous_spans"][0]
+    # span covers just the RLO (last char of added line 1)
+    assert span["position"]["start"] == {"line": 1, "column": 2}
+    assert span["position"]["end"] == {"line": 1, "column": 3}
+    assert span["diff_position"]["start"] == {"line": 4, "column": 3}
+    assert span["diff_position"]["end"] == {"line": 4, "column": 4}
+    # the PDF opener of the pair still maps to its own added line
+    controls = item["locations"]["controls"]
+    assert [(c["position"]["line"], c["position"]["column"])
+            for c in controls] == [(1, 2), (2, 1)]
+
+
+def test_no_newline_join_maps_errors_to_their_own_added_line(client):
+    # An unclosed opener on the glued-on line: the parser error (which
+    # reports the rebuilt line/col) must map to the added line holding
+    # the opener, not to the previous added line.
+    diff = (
+        "--- a/f.c\n+++ b/f.c\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+zz\n"
+        "\\ No newline at end of file\n"
+        f"+q{RLI}r\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    item = body["items"][0]
+    assert item["error_count"] == 1
+    err = item["locations"]["errors"][0]
+    assert err["position"] == {"line": 2, "column": 2}
+    assert err["diff_position"] == {"line": 6, "column": 3}
+    assert err["logical_index"] == 3
+    assert err["result_index"] == 0
+
+
 def test_files_without_additions_are_skipped(client):
     # pure deletion hunk + a context-only file
     diff = (

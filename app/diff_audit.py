@@ -21,6 +21,16 @@ finding (control character, error, dangerous span) is then mapped back to
 the new file's line/column and to the diff line it came from, while the
 original parse result keeps its logical-index view untouched.
 
+An added line followed by the ``\ No newline at end of file`` marker is
+rebuilt **without** a trailing ``\n``, so a following added line is glued
+onto the same rebuilt line.  Findings are therefore mapped by their
+logical offset in the rebuilt text, never by the parser's rebuilt line
+number: an inclusive position (control character, error character, span
+start) sitting exactly on the join point is the first character of the
+*following* added line, while a half-open span end on the join point (or
+on a synthetic ``\n`` separator) belongs to the *end* of the preceding
+added line.
+
 Paths carrying spaces or non-ASCII bytes appear in git diffs as C-style
 quoted strings (``"caf\\303\\251.py"``).  The ``diff --git`` header and
 the ``---``/``+++`` headers share one decoder that interprets the escapes
@@ -770,14 +780,37 @@ def _map_offset(
     index: int,
     entries: list[AddedLine],
     starts: list[int],
+    *,
+    half_open: bool = False,
 ) -> tuple[int, int, int, int]:
     """Map a logical index in the rebuilt text to (new line, new column,
-    diff line, diff column).  Indices on the synthetic ``\\n`` separator
-    map to the end of the preceding added line."""
+    diff line, diff column).
+
+    Inclusive positions (a control character's own index, a span start)
+    belong to the added line containing that character; half-open
+    positions (a span's exclusive end) belong to the end of the added
+    line holding the span's last character.  At the boundary
+    ``starts[k] + len(entries[k].text)`` this means:
+
+    * with a ``\\n`` separator (the common case) the boundary index *is*
+      the synthetic newline and maps to the end of line ``k``;
+    * at a no-newline join the boundary index is the first character of
+      line ``k + 1``: inclusive positions map to that line, while a
+      half-open end still maps to the end of line ``k``.
+    """
     for k, entry in enumerate(entries):
         start = starts[k]
-        length = len(entry.text)
-        if start <= index <= start + length:
+        end = start + len(entry.text)
+        if index == end and (half_open or not entry.no_newline):
+            # Synthetic '\n' separator, or a half-open span end: the
+            # position closes this line (column one past its last
+            # character).
+            closes_line = True
+        else:
+            # At a no-newline join the boundary index is the next line's
+            # first character, so only a strict containment closes here.
+            closes_line = index < end
+        if start <= index and closes_line:
             column = index - start + 1
             return (
                 entry.new_line,
@@ -791,6 +824,18 @@ def _map_offset(
     return entry.new_line, column, entry.diff_line, column + 1
 
 
+def _offset_of_line_col(text: str, line: int, column: int) -> int:
+    """Logical index of a 1-based ``line``/``column`` of the rebuilt text
+    (the inverse of the parser's own line/col computation)."""
+    offset = 0
+    for _ in range(line - 1):
+        newline = text.find("\n", offset)
+        if newline == -1:
+            break
+        offset = newline + 1
+    return offset + column - 1
+
+
 def _position(line: int, column: int) -> dict:
     return {"line": line, "column": column}
 
@@ -802,17 +847,21 @@ def _build_locations(
     text: str,
     result: dict,
 ) -> dict:
+    # Every finding is mapped by its logical offset in the rebuilt text:
+    # a no-newline join glues two added lines into one rebuilt line, so
+    # the rebuilt line number reported by the parser does not identify
+    # the added entry a finding belongs to.
     controls: list[dict] = []
     for i, control in enumerate(result["controls"]):
-        # Rebuilt lines correspond 1:1 to added entries.
-        entry = entries[control["position"]["line"] - 1]
-        column = control["position"]["column"]
+        line, column, diff_line, diff_column = _map_offset(
+            control["logical_index"], entries, starts
+        )
         controls.append({
             "result_index": i,
             "logical_index": control["logical_index"],
             "path": path,
-            "position": _position(entry.new_line, column),
-            "diff_position": _position(entry.diff_line, column + 1),
+            "position": _position(line, column),
+            "diff_position": _position(diff_line, diff_column),
         })
 
     errors: list[dict] = []
@@ -823,23 +872,35 @@ def _build_locations(
         match = _POS_RE.search(message)
         if match is None:
             continue
-        pline, pcolumn = (int(g) for g in match.groups())
-        entry = entries[pline - 1]
         index_match = _LOGICAL_INDEX_RE.search(message)
+        if index_match is not None:
+            index = int(index_match.group(1))
+        else:
+            # No logical index to map by: derive the offset from the
+            # rebuilt-text line/column instead.
+            pline, pcolumn = (int(g) for g in match.groups())
+            index = _offset_of_line_col(text, pline, pcolumn)
+        line, column, diff_line, diff_column = _map_offset(
+            index, entries, starts
+        )
         errors.append({
             "result_index": i,
             "logical_index": (
                 int(index_match.group(1)) if index_match else None
             ),
             "path": path,
-            "position": _position(entry.new_line, pcolumn),
-            "diff_position": _position(entry.diff_line, pcolumn + 1),
+            "position": _position(line, column),
+            "diff_position": _position(diff_line, diff_column),
         })
 
     spans: list[dict] = []
     for i, span in enumerate(result["dangerous_spans"]):
+        # The start is inclusive (the opener character); the end is the
+        # half-open position one past the span's last character.
         sl, sc, sdl, sdc = _map_offset(span["start"], entries, starts)
-        el, ec, edl, edc = _map_offset(span["end"], entries, starts)
+        el, ec, edl, edc = _map_offset(
+            span["end"], entries, starts, half_open=True
+        )
         spans.append({
             "result_index": i,
             "start_logical_index": span["start"],

@@ -166,6 +166,95 @@ def test_no_newline_mid_hunk_then_more_lines(client):
     assert item["result"]["controls"][0]["logical_index"] == 0
 
 
+def test_no_newline_join_maps_findings_to_their_own_added_line(client):
+    # The first added line carries the no-newline marker, so the rebuilt
+    # text glues "plain" and "x<RLO>y" onto one rebuilt line; the RLO and
+    # its unclosed-override error still belong to the *second* added line.
+    diff = (
+        "--- a\n+++ b\n@@ -0,0 +1,3 @@\n"
+        "+plain\n"
+        "\\ No newline at end of file\n"
+        f"+x{RLO}y\n"
+        "+tail\n"
+    )
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 201, resp.text
+    item = resp.json()["items"][0]
+    # rebuilt text glues the first two added lines: "plain" + "x<RLO>y\n" ...
+    assert item["text_length"] == len(f"plainx{RLO}y\ntail\n")
+    # the original parse result keeps its rebuilt-text view untouched
+    assert item["result"]["controls"][0]["logical_index"] == 6
+    assert item["result"]["controls"][0]["position"] == {"line": 1, "column": 7}
+
+    control = item["locations"]["controls"][0]
+    # ...while the location maps to the added line the char came from
+    assert control["position"] == {"line": 2, "column": 2}
+    assert control["diff_position"] == {"line": 6, "column": 3}
+    assert control["logical_index"] == 6
+
+    error = item["locations"]["errors"][0]
+    assert error["position"] == {"line": 2, "column": 2}
+    assert error["diff_position"] == {"line": 6, "column": 3}
+    assert error["logical_index"] == 6
+
+    span = item["locations"]["dangerous_spans"][0]
+    assert span["position"]["start"] == {"line": 2, "column": 2}
+    assert span["diff_position"]["start"] == {"line": 6, "column": 3}
+    # unclosed override runs to the end of the rebuilt text: the end of
+    # the last added line (new line 3, diff line 7)
+    assert span["position"]["end"] == {"line": 3, "column": 5}
+    assert span["diff_position"]["end"] == {"line": 7, "column": 6}
+
+
+def test_no_newline_join_start_belongs_to_following_line(client):
+    # The RLO is the first character of the added line after the join: an
+    # inclusive position at the join offset belongs to the following line.
+    diff = (
+        "--- a\n+++ b\n@@ -0,0 +1,2 @@\n"
+        "+ab\n"
+        "\\ No newline at end of file\n"
+        f"+{RLO}cd{PDF}\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    item = body["items"][0]
+    control = item["locations"]["controls"][0]
+    assert control["position"] == {"line": 2, "column": 1}
+    assert control["diff_position"] == {"line": 6, "column": 2}
+    span = item["locations"]["dangerous_spans"][0]
+    assert span["position"]["start"] == {"line": 2, "column": 1}
+    assert span["diff_position"]["start"] == {"line": 6, "column": 2}
+    # balanced span ends just past 'd' on the same added line
+    assert span["position"]["end"] == {"line": 2, "column": 4}
+    assert span["diff_position"]["end"] == {"line": 6, "column": 5}
+
+
+def test_no_newline_join_half_open_end_belongs_to_preceding_line(client):
+    # The closing PDF is the first character of the added line after the
+    # join, so the half-open span end lands exactly on the join offset:
+    # it belongs to the end of the preceding added line.
+    diff = (
+        "--- a\n+++ b\n@@ -0,0 +1,2 @@\n"
+        f"+{RLO}ab\n"
+        "\\ No newline at end of file\n"
+        f"+{PDF}cd\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    item = body["items"][0]
+    span = item["locations"]["dangerous_spans"][0]
+    assert span["position"] == {
+        "start": {"line": 1, "column": 1},
+        "end": {"line": 1, "column": 4},
+    }
+    assert span["diff_position"] == {
+        "start": {"line": 4, "column": 2},
+        "end": {"line": 4, "column": 5},
+    }
+    # the PDF itself is an inclusive position: first char of the next line
+    pdf = item["locations"]["controls"][1]
+    assert pdf["position"] == {"line": 2, "column": 1}
+    assert pdf["diff_position"] == {"line": 6, "column": 2}
+
+
 def test_files_without_additions_are_skipped(client):
     # pure deletion hunk + a context-only file
     diff = (

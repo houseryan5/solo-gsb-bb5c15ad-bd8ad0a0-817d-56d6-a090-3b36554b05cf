@@ -17,9 +17,15 @@ binary patches stay valid even though they carry no text hunk.
 
 For every file containing added lines the added text is rebuilt in
 new-file order and fed to :func:`app.bidi.parse_bidi`.  Every parser
-finding (control character, error, dangerous span) is then mapped back to
-the new file's line/column and to the diff line it came from, while the
-original parse result keeps its logical-index view untouched.
+finding (control character, error, dangerous span) is then mapped back
+to the new file's line/column and to the diff line it came from **via
+its logical offset** in the rebuilt text, while the original parse
+result keeps its logical-index view untouched.  Offset-based mapping
+stays correct when a ``\ No newline at end of file`` marker glues two
+added lines onto one rebuilt line: an inclusive position (control,
+error, span start) at the join offset belongs to the following added
+line whose first character sits there, while a half-open span end at
+the join offset belongs to the end of the preceding added line.
 
 Paths carrying spaces or non-ASCII bytes appear in git diffs as C-style
 quoted strings (``"caf\\303\\251.py"``).  The ``diff --git`` header and
@@ -770,14 +776,32 @@ def _map_offset(
     index: int,
     entries: list[AddedLine],
     starts: list[int],
+    *,
+    end: bool = False,
 ) -> tuple[int, int, int, int]:
     """Map a logical index in the rebuilt text to (new line, new column,
-    diff line, diff column).  Indices on the synthetic ``\\n`` separator
-    map to the end of the preceding added line."""
+    diff line, diff column).
+
+    An added line followed by the ``\\ No newline at end of file`` marker
+    is glued to the next added line without a separator, so one rebuilt
+    line can hold several added lines and the *join offset* is both the
+    end of the earlier entry and the start of the later one.  Ownership of
+    that offset depends on the position kind:
+
+    * inclusive positions (control characters, error positions, span
+      starts) belong to the **following** added line, whose first
+      character sits exactly at the join offset;
+    * half-open span ends (``end=True``) belong to the **preceding**
+      added line: the offset is one past its last character, reported as
+      that line's end-of-line column.
+
+    Indices on a synthetic ``\\n`` separator map to the end of the
+    preceding added line in both cases.
+    """
     for k, entry in enumerate(entries):
         start = starts[k]
         length = len(entry.text)
-        if start <= index <= start + length:
+        if start <= index < start + length:
             column = index - start + 1
             return (
                 entry.new_line,
@@ -785,6 +809,20 @@ def _map_offset(
                 entry.diff_line,
                 column + 1,  # the '+' prefix shifts diff columns by one
             )
+        if index == start + length:
+            # Boundary offset: the synthetic '\n' (or end of text) for a
+            # newline-terminated entry, a join point for a no-newline one.
+            joined = entry.no_newline and k + 1 < len(entries)
+            if end or not joined:
+                column = length + 1
+                return (
+                    entry.new_line,
+                    column,
+                    entry.diff_line,
+                    column + 1,
+                )
+            # Inclusive position at a join: fall through to the next
+            # entry, whose text starts at exactly this offset.
     # Defensive fallback: clamp to the end of the last added line.
     entry = entries[-1]
     column = len(entry.text) + 1
@@ -802,44 +840,60 @@ def _build_locations(
     text: str,
     result: dict,
 ) -> dict:
+    # Every finding is mapped through its logical offset in the rebuilt
+    # text, never through the rebuilt line number: a no-newline marker
+    # glues consecutive added lines onto one rebuilt line, so rebuilt
+    # line N is not necessarily added entry N.
     controls: list[dict] = []
     for i, control in enumerate(result["controls"]):
-        # Rebuilt lines correspond 1:1 to added entries.
-        entry = entries[control["position"]["line"] - 1]
-        column = control["position"]["column"]
+        logical = control["logical_index"]
+        new_line, column, diff_line, diff_column = _map_offset(
+            logical, entries, starts
+        )
         controls.append({
             "result_index": i,
-            "logical_index": control["logical_index"],
+            "logical_index": logical,
             "path": path,
-            "position": _position(entry.new_line, column),
-            "diff_position": _position(entry.diff_line, column + 1),
+            "position": _position(new_line, column),
+            "diff_position": _position(diff_line, diff_column),
         })
 
     errors: list[dict] = []
     for i, message in enumerate(result["errors"]):
-        # The first "(line N, col M)" is the flagged character's own
-        # position; implicit-termination messages add a second one for the
-        # PDI that closed the scope, which is not what we map to.
-        match = _POS_RE.search(message)
-        if match is None:
-            continue
-        pline, pcolumn = (int(g) for g in match.groups())
-        entry = entries[pline - 1]
+        # The first "at logical index N" is the flagged character's own
+        # offset; implicit-termination messages mention a second index
+        # for the PDI that closed the scope, which is not what we map to.
         index_match = _LOGICAL_INDEX_RE.search(message)
+        if index_match is not None:
+            logical = int(index_match.group(1))
+            new_line, column, diff_line, diff_column = _map_offset(
+                logical, entries, starts
+            )
+        else:
+            # No logical offset: fall back to the first "(line N, col M)"
+            # rebuilt-text position carried by the message.
+            match = _POS_RE.search(message)
+            if match is None:
+                continue
+            logical = None
+            pline, column = (int(g) for g in match.groups())
+            entry = entries[pline - 1]
+            new_line, diff_line = entry.new_line, entry.diff_line
+            diff_column = column + 1
         errors.append({
             "result_index": i,
-            "logical_index": (
-                int(index_match.group(1)) if index_match else None
-            ),
+            "logical_index": logical,
             "path": path,
-            "position": _position(entry.new_line, pcolumn),
-            "diff_position": _position(entry.diff_line, pcolumn + 1),
+            "position": _position(new_line, column),
+            "diff_position": _position(diff_line, diff_column),
         })
 
     spans: list[dict] = []
     for i, span in enumerate(result["dangerous_spans"]):
         sl, sc, sdl, sdc = _map_offset(span["start"], entries, starts)
-        el, ec, edl, edc = _map_offset(span["end"], entries, starts)
+        el, ec, edl, edc = _map_offset(
+            span["end"], entries, starts, end=True
+        )
         spans.append({
             "result_index": i,
             "start_logical_index": span["start"],
